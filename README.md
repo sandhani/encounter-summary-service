@@ -83,6 +83,12 @@ Redrive transaction accepts only a failed current job, resets the attempt budget
 
 ## Verification and operations
 
-Six automated tests assert: concurrent duplicate delivery schedules once; version gaps and late events preserve current state and snapshot; restart and expired-lease fencing recover without overwrites or replaying committed results; out-of-order completion preserves current summary; identity/version/event conflicts roll back; bounded retry exhaustion and redrive preserve SLA semantics.
+The suite contains 28 tests across `test_store.py`, `test_robustness.py`, and `test_api.py`. The original reliability tests assert: concurrent duplicate delivery schedules once; version gaps and late events preserve current state and snapshot; restart and expired-lease fencing recover without overwrites or replaying committed results; out-of-order completion preserves current summary; identity/version/event conflicts roll back; bounded retry exhaustion and redrive preserve SLA semantics.
 
 Persisted acceptance/start/finish, attempts, due time, lease expiry, status and error codes enable inspection without transcripts. Production monitoring should export queue depth/oldest age, active and expired leases, acceptance-to-ready latency, SLA breaches, provider duration/error/rate-limit counts, attempts and failed/superseded counts. Alert on current unfinished jobs older than ten seconds, growing queue age, expired leases and failed jobs; a breach is operational, not terminal. These exporters/alerts are documented integration points, not installed monitoring infrastructure. Avoid identifiers as metric labels and avoid transcripts, summaries or raw provider exceptions in logs. `/health` checks database access but does not imply provider readiness. Bound polling load and scale workers based on queue delay and provider quotas.
+
+Additional tests cover concurrent version arrivals and worker claims, abandoned-lease attempt exhaustion, transactional rollback, retry deadlines, supersession without paid calls, redrive restrictions, SLA boundaries, unchanged long Unicode transcripts, sanitized provider failures and HTTP error retry policies. HTTP tests exercise request parsing and response serialization with in-memory connections, including lifecycle/status codes, malformed bodies, size limits, missing resources, health and storage failures; they do not bind a listening socket or invoke a live AI provider.
+
+## Architecture diagrams
+
+[Open the editable HLD and LLD diagrams in Lucidchart](https://lucid.app/lucidchart/dbd10843-88ef-4450-8731-6344f7b33dec/edit). The three pages cover the service overview, ingestion and current-summary reads, and worker retries/recovery. The diagrams are a snapshot of the implemented service.

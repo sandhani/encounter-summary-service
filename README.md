@@ -92,3 +92,45 @@ Additional tests cover concurrent version arrivals and worker claims, abandoned-
 ## Architecture diagrams
 
 [Open the editable HLD and LLD diagrams in Lucidchart](https://lucid.app/lucidchart/dbd10843-88ef-4450-8731-6344f7b33dec/edit). The three pages cover the service overview, ingestion and current-summary reads, and worker retries/recovery. The diagrams are a snapshot of the implemented service.
+
+## Run 10,000 scenario cases
+
+A reproducible synthetic dataset and assertion-based runner cover duplicate races, version gaps, restart/lease recovery, out-of-order results, a simulated twenty-minute outage, conflicts and rollback. See [dataset instructions and coverage](test_data/README.md).
+
+```sh
+python3 tools/scenario_cases.py run
+```
+
+No real AI calls are made. Results are saved in `test_data/results.json`; a failed case causes a nonzero exit code.
+
+## Test incident groups through the live API
+
+For **1,000 incidents, 3,000 patients and 9,000 encounters**, use the [live API and worker test guide](test_data/INCIDENTS.md). This starts actual API/worker processes and a free synthetic HTTP summary provider, then submits 90,000 update requests and verifies current-version results.
+
+```sh
+python3 tools/incident_e2e.py run --output test_data/incident-e2e-my-run
+```
+
+## Follow worker processing in the logs
+
+Workers emit one JSON object per workflow event to stderr by default:
+
+```sh
+SUMMARY_MOCK=1 python3 -m encounter_service.worker --db encounters.db
+
+# Append events to a file instead:
+SUMMARY_MOCK=1 python3 -m encounter_service.worker --db encounters.db --log-file /tmp/worker-workflow.jsonl
+```
+
+Use the same database path as the API. Existing ready/failed jobs are not automatically reprocessed: submit a newer snapshot to see a fresh workflow. The completed bulk-run database has no pending work. To capture a new bulk run, `python3 tools/incident_e2e.py run --output test_data/incident-e2e-logged` starts workers whose JSON events appear in that run's `process.log`.
+
+A successful workflow emits:
+
+1. `job_claimed`: the database claim has committed; queued → processing, exact immutable input version, attempt and lease deadline.
+2. `summary_generation_started`: the input has been loaded and the provider call is about to start; includes character count, not transcription content.
+3. `summary_generation_finished`: the provider returned; the job is still processing until persistence succeeds.
+4. `job_state_committed`: result/status transaction has committed; processing → ready, queued for retry, or failed. Includes sanitized error, retry due time, `summary_saved`, and `is_current` as observed in that transaction.
+
+Errors emit `summary_generation_failed` before the state decision. A fenced completion emits `completion_rejected` and cannot emit a successful commit. Correlate by `encounter_id`, `version`, `claim_id`, `worker_pid` and UTC timestamp. In the synthetic incident dataset, encounter IDs such as `inc-0000-pat-00-type-0` identify the incident group; no separate incident field is stored or inferred for arbitrary IDs.
+
+These logs demonstrate orchestration, not transcription generation: the API receives the full transcription and the worker summarizes it. They exclude patient IDs, transcript/summary text and raw exception details. Standard logs are best-effort observability, not an atomic audit ledger: a crash between database commit and logging can leave a committed change without its log entry. Query the database as the source of truth.

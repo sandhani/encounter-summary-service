@@ -3,3 +3,5 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+/test_data/*e2e*/
+/test_data/e2e-run/

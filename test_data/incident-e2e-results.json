@@ -1,0 +1,21 @@
+{
+  "encounters": 9000,
+  "incidents": 1000,
+  "patients": 3000,
+  "passed": true,
+  "http_outcomes": {
+    "202:accepted_current": 18000,
+    "200:duplicate": 27000,
+    "200:stale": 9000,
+    "409:encounter identity conflict": 18000,
+    "409:encounter version content conflict": 9000,
+    "409:event ID content conflict": 9000
+  },
+  "results": {
+    "ready": 6750,
+    "sla_breached": 1,
+    "failed": 2250
+  },
+  "provider_invocations": 14437,
+  "duration_seconds": 108.887
+}

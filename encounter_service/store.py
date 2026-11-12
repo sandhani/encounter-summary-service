@@ -5,6 +5,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from .workflow_log import emit
 
 TYPES = {'Appointment', 'MedicationRefill', 'TelephoneTriage'}
 
@@ -120,19 +121,37 @@ class Store:
             token = uuid.uuid4().hex
             db.execute("UPDATE jobs SET status='processing', attempts=attempts+1, token=?, lease=?, started=COALESCE(started,?) WHERE encounter=? AND version=?", (token, now+lease_seconds, now, r['encounter'], r['version']))
             transcript = db.execute('SELECT transcription FROM versions WHERE encounter=? AND version=?', (r['encounter'], r['version'])).fetchone()[0]
-            return dict(encounter=r['encounter'], version=r['version'], token=token, transcription=transcript)
+            job = dict(encounter=r['encounter'], version=r['version'], token=token, transcription=transcript)
+            attempt = r['attempts'] + 1
+        emit('job_claimed', encounter_id=job['encounter'], version=job['version'],
+             claim_id=token, attempt=attempt, previous_state='queued', state='processing',
+             lease_expires_at=now+lease_seconds, input_source='immutable_version_snapshot')
+        return job
 
     def complete(self, job, summary=None, error=None, max_attempts=6, permanent=False):
         now = self.clock()
         with self.tx() as db:
             r = db.execute("SELECT * FROM jobs WHERE encounter=? AND version=? AND token=? AND status='processing'", (job['encounter'], job['version'], job['token'])).fetchone()
             if not r:
+                rejected = True
+            else:
+                rejected = False
+            if rejected:
+                emit('completion_rejected', encounter_id=job['encounter'], version=job['version'],
+                     claim_id=job['token'], reason='claim_no_longer_owns_processing_job')
                 return False
             status = 'ready' if error is None else ('failed' if permanent or r['attempts'] >= max_attempts else 'queued')
             delay = random.uniform(.5, 1) * min(300, 2 ** r['attempts'])
             db.execute('UPDATE jobs SET status=?, summary=?, error=?, due=?, finished=?, token=NULL WHERE encounter=? AND version=?',
                        (status, summary, error, now+delay, now if status in ('ready','failed') else None, r['encounter'], r['version']))
-            return True
+            current_version = db.execute('SELECT current_version FROM encounters WHERE id=?',
+                                         (job['encounter'],)).fetchone()[0]
+        emit('job_state_committed', encounter_id=job['encounter'], version=job['version'],
+             claim_id=job['token'], attempt=r['attempts'], previous_state='processing',
+             state=status, error=error, next_attempt_at=now+delay if status=='queued' else None,
+             summary_saved=status=='ready', current_version=current_version,
+             is_current=job['version']==current_version)
+        return True
 
     def redrive(self, enc, version):
         with self.tx() as db:

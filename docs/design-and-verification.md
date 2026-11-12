@@ -243,6 +243,153 @@ Version immutability, fixed encounter identity, valid statuses/types, positive v
 
 All versions are retained, including stale arrivals. This uses more storage than keeping only current state and processing snapshots, but makes exact inputs and deduplication straightforward. No worker re-reads a mutable “latest transcript.” Retention and deletion are outside this exercise.
 
+#### Physical SQLite schema
+
+The following DDL is taken directly from `Store.__init__()` in `encounter_service/store.py`. `PK` means primary key, `FK` means foreign key, and a composite key identifies a row using multiple columns together.
+
+```sql
+CREATE TABLE IF NOT EXISTS encounters (
+  id TEXT PRIMARY KEY, patient TEXT NOT NULL, type TEXT NOT NULL,
+  current_version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS versions (
+  encounter TEXT NOT NULL REFERENCES encounters(id), version INTEGER NOT NULL,
+  transcription TEXT NOT NULL, digest TEXT NOT NULL, accepted REAL NOT NULL,
+  PRIMARY KEY(encounter,version));
+CREATE TABLE IF NOT EXISTS events (
+  id TEXT PRIMARY KEY, digest TEXT NOT NULL,
+  encounter TEXT NOT NULL, version INTEGER NOT NULL,
+  FOREIGN KEY(encounter,version) REFERENCES versions(encounter,version));
+CREATE TABLE IF NOT EXISTS jobs (
+  encounter TEXT NOT NULL, version INTEGER NOT NULL,
+  status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+  due REAL NOT NULL, token TEXT, lease REAL, started REAL, finished REAL,
+  summary TEXT, error TEXT,
+  PRIMARY KEY(encounter,version),
+  FOREIGN KEY(encounter,version) REFERENCES versions(encounter,version));
+CREATE INDEX IF NOT EXISTS jobs_due ON jobs(status,due);
+```
+
+#### Column definitions
+
+**`encounters` — current encounter identity and version pointer**
+
+| Column | SQLite type | Required / default | Meaning |
+|---|---|---|---|
+| `id` | TEXT | PK; nonempty string validated by API | Encounter ID; API field `encounter_id` |
+| `patient` | TEXT | NOT NULL | Fixed patient ID; API field `patient_id` |
+| `type` | TEXT | NOT NULL | Fixed encounter type; API field `encounter_type` |
+| `current_version` | INTEGER | NOT NULL | Highest accepted version for this encounter |
+
+There is no separate patient table: the service stores the partner's patient identifier, not a patient demographic record. Patient IDs are not unique in `encounters`; one patient can own multiple encounters of the same or different types. There is no incident table or `incident_id` column. Incident grouping in the bulk test is dataset metadata, represented in synthetic encounter IDs.
+
+**`versions` — immutable snapshot input**
+
+| Column | SQLite type | Required / default | Meaning |
+|---|---|---|---|
+| `encounter` | TEXT | NOT NULL; composite PK; FK | Owning `encounters.id` |
+| `version` | INTEGER | NOT NULL; composite PK | Version within this encounter; gaps allowed |
+| `transcription` | TEXT | NOT NULL | Full input transcript for this exact version |
+| `digest` | TEXT | NOT NULL | Canonical SHA-256 digest of logical event content |
+| `accepted` | REAL | NOT NULL | First stored timestamp for this version, in Unix seconds |
+
+A stale version is also retained here, even though it has no summary job. Duplicate delivery does not reset `accepted`. Immutability is a write-path rule; there is no database UPDATE-prevention trigger.
+
+**`events` — global delivery identity / deduplication receipts**
+
+| Column | SQLite type | Required / default | Meaning |
+|---|---|---|---|
+| `id` | TEXT | PK; nonempty string validated by API | Global `event_id` |
+| `digest` | TEXT | NOT NULL | Detects inconsistent reuse of the same event ID |
+| `encounter` | TEXT | NOT NULL; composite FK | Target version's encounter |
+| `version` | INTEGER | NOT NULL; composite FK | Target version number |
+
+The FK uses `(encounter, version)` together. Neither field alone identifies a version. Multiple event IDs can reference the same version when identical logical content arrives under alias IDs. Therefore `(encounter, version)` is intentionally **not unique in events**; it is unique in `versions`.
+
+**`jobs` — durable queue, processing ownership, status and result**
+
+| Column | SQLite type | Required / default | Meaning |
+|---|---|---|---|
+| `encounter` | TEXT | NOT NULL; composite PK/FK | Exact version's encounter |
+| `version` | INTEGER | NOT NULL; composite PK/FK | Exact summary input version |
+| `status` | TEXT | NOT NULL | `queued`, `processing`, `ready`, `failed`, or `superseded` |
+| `attempts` | INTEGER | NOT NULL; DEFAULT 0 | Claims consumed in the current automatic retry/redrive cycle |
+| `due` | REAL | NOT NULL | Earliest claim time when queued; initially acceptance time |
+| `token` | TEXT | Nullable | Unique generated claim token used to fence outdated completions |
+| `lease` | REAL | Nullable | Lease-expiry timestamp for the claim |
+| `started` | REAL | Nullable | First processing-start timestamp, preserved across retries/redrive |
+| `finished` | REAL | Nullable | Terminal completion/supersession timestamp; cleared on redrive |
+| `summary` | TEXT | Nullable | Generated result for this exact version; normally present only when ready |
+| `error` | TEXT | Nullable | Sanitized provider or attempt-budget error category |
+
+`due`, `lease`, `started`, `finished`, and `accepted` use Unix seconds, including fractional seconds. Some inactive fields are retained: for example, a ready job can retain its previous lease/due values. Interpret those fields alongside `status`; they do not make a terminal job eligible for processing. `token` is cleared on accepted completion. It is generated with UUID hex but has no UNIQUE constraint in the schema.
+
+#### Primary keys, indexes and relationship enforcement
+
+| Key / index | Enforcement | Purpose |
+|---|---|---|
+| `encounters` PK `(id)` | SQLite primary-key unique index | One row per encounter |
+| `versions` PK `(encounter, version)` | SQLite composite primary-key unique index | One logical snapshot per encounter/version |
+| `events` PK `(id)` | SQLite primary-key unique index | Global event-ID uniqueness |
+| `jobs` PK `(encounter, version)` | SQLite composite primary-key unique index | At most one job/result row per version |
+| `jobs_due(status, due)` | Explicit nonunique index | Find due queued jobs by status and time |
+
+No explicit patient/type, token, or receipt-version lookup index exists. Composite PK indexes support lookups by encounter and encounter/version. SQLite does not automatically add a child-column index for every foreign key.
+
+Relationships enforced with `PRAGMA foreign_keys=ON` on every service connection:
+
+- `versions.encounter` references `encounters.id`.
+- `events.(encounter, version)` references `versions.(encounter, version)`.
+- `jobs.(encounter, version)` references `versions.(encounter, version)`.
+
+The application creates at least one receipt for every version and exactly one job for every advancing version. The database relationships alone allow a version with zero receipts or zero jobs; those minimum cardinalities are application guarantees. Stale-only versions deliberately have zero jobs. Summary results are stored inside `jobs`, not in a separate summary table.
+
+No cascading delete or update actions are declared: SQLite's default `NO ACTION` applies, so deleting referenced parents is rejected while child rows remain. A future retention process must delete dependents in the correct order or introduce an explicit retention schema/policy.
+
+**SQLite constraint limits:** these are ordinary SQLite rowid tables, not STRICT or WITHOUT ROWID tables. In this schema, the single-column `TEXT PRIMARY KEY` declarations do not explicitly say `NOT NULL`; ordinary SQLite rowid tables can permit NULL in such primary keys. The application rejects missing/empty IDs. Composite keys explicitly mark both participating columns NOT NULL. SQLite type affinity also does not replace application type validation. Direct SQL writers must not bypass the service's rules.
+
+The pointer `(encounters.id, encounters.current_version)` is a logical reference to a version, not a declared composite FK. `Store.ingest()` maintains it in the same transaction as version/job insertion. Fixed patient/type, positive integer version, allowed status/type values, monotonic version advancement, result/status consistency and input immutability are enforced by the application rather than CHECK constraints or triggers.
+
+#### Useful schema and workflow inspection queries
+
+```sql
+-- Confirm which SQLite file is open.
+PRAGMA database_list;
+
+-- Inspect columns, PK positions, FKs and indexes.
+PRAGMA table_info(encounters);
+PRAGMA table_info(versions);
+PRAGMA table_info(events);
+PRAGMA table_info(jobs);
+PRAGMA foreign_key_list(jobs);
+PRAGMA index_list(jobs);
+PRAGMA index_info(jobs_due);
+PRAGMA foreign_key_check;
+
+-- Exact CREATE statements, including explicit indexes.
+SELECT type, name, sql
+FROM sqlite_master
+WHERE type IN ('table', 'index') AND sql IS NOT NULL
+ORDER BY type, name;
+
+-- Current workflow per encounter without reading clinical content.
+SELECT e.id AS encounter_id, e.current_version,
+       j.status, j.attempts, j.due, j.lease, j.started, j.finished, j.error
+FROM encounters AS e
+JOIN jobs AS j
+  ON j.encounter = e.id AND j.version = e.current_version
+ORDER BY e.id
+LIMIT 50;
+
+-- Current jobs grouped by state; excludes historical jobs.
+SELECT j.status, COUNT(*) AS job_count
+FROM encounters AS e
+JOIN jobs AS j
+  ON j.encounter = e.id AND j.version = e.current_version
+GROUP BY j.status;
+```
+
+Foreign-key enforcement is a connection setting: enable it explicitly if you open an external SQL client and intend to write. These inspection queries are read-only. For the full incident test, connect to `test_data/incident-e2e-full/encounters.db`; the default root `encounters.db` is a different database.
+
 ### Processing logic
 
 #### Ingestion pseudocode
@@ -385,7 +532,7 @@ An identical event replay does not redrive a failed job: it is still a duplicate
 | Newer version and out-of-order completion | Claim 12, ingest/claim 13, complete 13 then 12; separately leave an obsolete job queued | Current returns 13's result; 12 is historical. Queued obsolete work is superseded with no provider invocation. |
 | Outage, conflicts and operational boundaries | Inject retryable/permanent provider errors, exhaust attempts and redrive; submit conflicting identities; cross SLA boundary | Retry timing follows due times; permanent errors fail immediately; six claims bound recovery cost; only failed-current redrive succeeds; conflicts leave state unchanged; SLA breach alone preserves workflow status. |
 
-The project contains 28 automated tests, including HTTP request/response lifecycle coverage, long Unicode transcript preservation and error sanitization. Run:
+The project contains 32 automated tests, including HTTP request/response lifecycle coverage, long Unicode transcript preservation and error sanitization. Run:
 
 ```sh
 python3 -m unittest discover -s tests -v
@@ -401,6 +548,6 @@ Tests use temporary SQLite databases, injected clocks, mocked providers and in-m
 
 **Recommended alerts:** unfinished current job older than ten seconds; sustained queue-age growth; expired leases with no worker recovery; spikes in provider errors/rate limits; terminal failures; and database write failures. A ten-second alert reports an SLA breach rather than forcing terminal failure.
 
-**Recommended structured logs:** opaque correlation/job identifiers, version, worker identity, attempt number, state transition, duration and sanitized error category. Avoid patient IDs where possible, keep identifiers out of metric labels, and do not log transcriptions, summaries, payload digests, raw provider bodies, credentials or exception text. The current HTTP handler suppresses default access logs; worker failures persist safe categories rather than raw exception messages. Metrics exporters, alerts and structured transition logging are integration recommendations, not installed components.
+**Recommended structured logs:** opaque correlation/job identifiers, version, worker identity, attempt number, state transition, duration and sanitized error category. Avoid patient IDs where possible, keep identifiers out of metric labels, and do not log transcriptions, summaries, payload digests, raw provider bodies, credentials or exception text. The current HTTP handler suppresses default access logs; worker failures persist safe categories rather than raw exception messages. Structured worker transition logging is implemented: see the README section “Follow worker processing in the logs.” Metrics exporters and alerts remain integration recommendations, not installed components.
 
 To investigate a stuck job: determine whether it is current, compare acceptance age to the SLA, inspect status/due/lease/attempts, check worker liveness and queue depth, then correlate provider error/latency and database health. If terminally failed, fix the underlying dependency before an explicit redrive. No patient content is needed for this diagnosis.

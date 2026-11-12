@@ -68,7 +68,7 @@ class ApiTests(unittest.TestCase):
         self.store.complete(self.store.claim(), error='permanent', permanent=True)
         status, result = self.request('GET', path)
         self.assertEqual((status, result['status']), (200, 'failed'))
-        self.assertNotIn('transcription', result)
+        self.assertEqual(result['transcription'], event(2)['payload']['transcription'])
 
     def test_malformed_requests_and_size_limits(self):
         for body in (b'{', b'[]', b'null', b'{}', b'{"version":true}'):
@@ -95,3 +95,34 @@ class ApiTests(unittest.TestCase):
 
     def test_health(self):
         self.assertEqual(self.request('GET', '/health'), (200, {'status': 'ok'}))
+
+
+    def test_transcription_and_summary_always_match_current_version(self):
+        first = event(12)
+        first['payload']['transcription'] = 'Nurse: Symptoms?\nPatient: ठीक है.\n' * 1000
+        self.post(first)
+        old_job = self.store.claim()
+        second = event(13)
+        self.post(second)
+        path = '/encounters/enc/summary'
+        status, result = self.request('GET', path)
+        self.assertEqual(status, 200)
+        self.assertEqual(result['version'], 13)
+        self.assertEqual(result['transcription'], second['payload']['transcription'])
+        self.assertIsNone(result['summary'])
+        self.store.complete(self.store.claim(), 'Version 13 summary')
+        self.store.complete(old_job, 'Version 12 summary')
+        result = self.request('GET', path)[1]
+        self.assertEqual(result['transcription'], second['payload']['transcription'])
+        self.assertEqual(result['summary'], 'Version 13 summary')
+
+    def test_full_transcription_is_returned_unchanged_while_processing_and_ready(self):
+        data = event()
+        data['payload']['transcription'] = 'Nurse: Symptoms?\nPatient: ठीक है.\n' * 1000
+        self.post(data)
+        path = '/encounters/enc/summary'
+        self.assertEqual(self.request('GET', path)[1]['transcription'], data['payload']['transcription'])
+        job = self.store.claim()
+        self.assertEqual(self.request('GET', path)[1]['transcription'], data['payload']['transcription'])
+        self.store.complete(job, 'Summary')
+        self.assertEqual(self.request('GET', path)[1]['transcription'], data['payload']['transcription'])

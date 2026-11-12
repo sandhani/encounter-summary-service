@@ -95,7 +95,7 @@ class Store:
 
     def progress(self, enc):
         with self.tx() as db:
-            row = db.execute('''SELECT e.*, j.*, v.accepted FROM encounters e
+            row = db.execute('''SELECT e.*, j.*, v.accepted, v.transcription FROM encounters e
                 JOIN jobs j ON j.encounter=e.id AND j.version=e.current_version
                 JOIN versions v ON v.encounter=j.encounter AND v.version=j.version
                 WHERE e.id=?''', (enc,)).fetchone()
@@ -104,6 +104,7 @@ class Store:
             r = dict(row)
             return dict(encounter_id=enc, patient_id=r['patient'], encounter_type=r['type'],
                         version=r['current_version'], status=r['status'], summary=r['summary'],
+                        transcription=r['transcription'],
                         attempts=r['attempts'], accepted_at=r['accepted'], started_at=r['started'],
                         finished_at=r['finished'], next_attempt_at=r['due'] if r['status']=='queued' else None,
                         error=r['error'], sla_breached=(r['finished'] or self.clock()) - r['accepted'] > 10)

@@ -1,3 +1,5 @@
+> **Current default: 100 cases.** `python3 tools/scenario_cases.py run` reads `scenarios-100.jsonl` and writes `results-100.json`. It covers all 12 groups (8–9 cases each). Use `--data test_data/scenarios-10000.jsonl --report /tmp/results-10000.json` to rerun the original full campaign described below. Generation defaults to 100; specify both `--count 10000` and a larger output path to generate 10,000.
+
 # 10,000 synthetic scenario cases
 
 `scenarios-10000.jsonl` contains exactly 10,000 independently runnable scenario records, generated with seed 42. Each line contains a unique case ID, scenario name, synthetic base event, and expected final state. The runner expands the base event into deliveries, conflicts, retries and worker actions. These are **10,000 scenario executions**, rather than 10,000 HTTP requests; a scenario can perform many operations.

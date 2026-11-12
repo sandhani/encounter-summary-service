@@ -493,7 +493,7 @@ The current-summary query joins only the job whose version equals `encounters.cu
 
 #### Retry and paid-call policy
 
-There are at most six automatic claims per job cycle. Claims consume attempts conservatively even when a worker crashes before dispatch. Retryable failures include 408, 429, 5xx, timeouts, and network exceptions. Other 4xx and provider failures raised as `ValueError` fail immediately. The adapter validates nonempty summary strings; malformed JSON and invalid summary values follow that permanent-error path. A missing `summary` key currently falls into the generic retryable exception path.
+There are at most six automatic claims per job cycle. Claims consume attempts conservatively even when a worker crashes before dispatch. Retryable failures include 408, 429, 5xx, timeouts, and network exceptions. Other 4xx and provider failures raised as `ValueError` fail immediately. The adapter validates nonempty summary strings; malformed JSON and invalid summary values follow that permanent-error path. A missing `summary` key in the HTTP adapter is now a permanent invalid-response failure.
 
 After attempts 1–5, the delay ranges are 1–2, 2–4, 4–8, 8–16 and 16–32 seconds. There is no delay after terminal attempt 6. The general formula caps delays at 300 seconds, though the six-attempt default never reaches that cap. `Retry-After` and a shared circuit breaker are not implemented.
 
@@ -551,7 +551,7 @@ An identical event replay does not redrive a failed job: it is still a duplicate
 | Newer version and out-of-order completion | Claim 12, ingest/claim 13, complete 13 then 12; separately leave an obsolete job queued | Current returns 13's result; 12 is historical. Queued obsolete work is superseded with no provider invocation. |
 | Outage, conflicts and operational boundaries | Inject retryable/permanent provider errors, exhaust attempts and redrive; submit conflicting identities; cross SLA boundary | Retry timing follows due times; permanent errors fail immediately; six claims bound recovery cost; only failed-current redrive succeeds; conflicts leave state unchanged; SLA breach alone preserves workflow status. |
 
-The project contains 32 automated tests, including HTTP request/response lifecycle coverage, long Unicode transcript preservation and error sanitization. Run:
+The project contains 41 automated tests, including HTTP request/response lifecycle coverage, long Unicode transcript preservation and error sanitization. Run:
 
 ```sh
 python3 -m unittest discover -s tests -v
@@ -607,7 +607,7 @@ This placeholder endpoint must be replaced. The adapter POSTs `{"transcription":
 python3 -m unittest discover -s tests -v
 ```
 
-The current suite has **32 passing tests**, including concurrency, rollback, restart/lease recovery, current-version protection, retries, conflicts, API contracts, Unicode input and privacy-safe workflow logs.
+The current suite has **41 passing tests**, including concurrency, rollback, restart/lease recovery, current-version protection, retries, conflicts, API contracts, Unicode input and privacy-safe workflow logs.
 
 ### Run the 10,000 isolated scenario campaign
 
@@ -667,7 +667,7 @@ job_state_committed           (or completion_rejected if ownership changed)
 1. **Single-host storage:** SQLite serializes writes and is not a multi-host queue. Multi-host scale requires a shared transactional database such as PostgreSQL with appropriate claim locking. No high-availability deployment is supplied.
 2. **Paid-call ambiguity:** external generation is not exactly once. A crash or lease overlap can repeat an invocation and its charge. Bounded claims limit automatic exposure, but an operator redrive opens another budget.
 3. **Deadline behavior:** the current 20-second socket timeout is not a strict end-to-end deadline; there is no lease heartbeat. A slow streaming response can outlive the 45-second lease. Fencing protects saved results while duplicate external cost remains possible.
-4. **Retry policy scope:** Retry-After, shared rate limiting and circuit breaking are not implemented. Most invalid provider responses fail immediately, but a missing summary key currently enters the generic retry path. Worker process supervision/restart is an operator responsibility outside the local test runner.
+4. **Retry policy scope:** Retry-After, shared rate limiting and circuit breaking are not implemented. Invalid provider responses, including missing summary text, fail immediately. Worker process supervision/restart is an operator responsibility outside the local test runner.
 5. **Schema hardening:** key/FK uniqueness is enforced in SQLite, while several invariants rely on application write paths. The tables are not STRICT, have no immutability triggers, and lack some CHECK/explicit NOT NULL constraints detailed in the data-model section. Arbitrary direct SQL writes can violate application rules.
 6. **Security and privacy deployment:** the local HTTP server is a reference server bound to loopback. Authentication, tenant/patient authorization, TLS, encryption at rest, secrets, audited access and managed backups must be supplied before use with clinical data. No regulatory certification or clinical suitability claim is made.
 7. **Retention and audit history:** snapshots/receipts/results are retained indefinitely. No cleanup workflow or append-only attempt/redrive audit trail is implemented. Redrive resets the attempt count in place.
@@ -678,3 +678,12 @@ job_state_committed           (or completion_rejected if ownership changed)
 ## Submission delivery
 
 This document and the optional repository link are intended to be returned through the same channel in which the task was received. No external email or client-channel delivery is performed by the implementation. The design, schema, transaction boundaries, failure trade-offs and verification limits above provide the basis for explaining each part of the submission.
+
+
+## LLM adapter implementation update — 12 November 2026
+
+A direct OpenAI Responses adapter is available in `encounter_service/summary_adapters.py`. Its callable contract remains `transcription -> summary`; database ownership, version fencing and retry transactions are unchanged. Select it using `USE_LLM=1` or `--use-llm` and supply `OPENAI_API_KEY` securely. The initial default is `gpt-6.1-terra`, configurable using `LLM_MODEL`; reasoning defaults to `low`. `--no-use-llm` overrides the environment flag, retaining the previous HTTP/mock provider selection. The API key is required before work is claimed.
+
+The adapter sends the complete transcript with separate factual-summary instructions, `store=false`, no tools, and a 2,048-output-token cap. It validates completed assistant output and rejects refusal, incomplete/truncated or empty output. One adapter call makes one remote request; the durable job policy remains responsible for retries. No live paid model invocation has been performed as part of this change; tests mock the HTTP boundary. The bulk runner disables LLM mode by default; explicit `run --use-llm` enables paid generation and `--limit` bounds the selected encounters.
+
+Model selection is a candidate recommendation, not clinical validation. [GPT-6.1 Terra](https://developers.openai.com/api/docs/models/gpt-6.1-terra) is the initial balance of writing and efficiency; [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) is the efficient high-volume candidate; [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) is the demanding-work candidate. Evaluate factual omissions, invented facts, negation/dose preservation, latency and cost on representative transcripts. Model access, provider terms, clinical review, strict deadlines and production security remain deployment considerations. Model/prompt metadata is logged at startup but not saved per job result. See the README's LLM section for complete configuration and run instructions.

@@ -1,3 +1,5 @@
+> **Current default: 100 encounters.** Commands without `--limit` now ingest 100 rows, not the full dataset. Use `--limit 9000` for the original full campaign. Use `python3 tools/scenario_cases.py run` for 100 deterministic cases covering all 12 scenario groups. Historical full-run results below remain unchanged.
+
 # Live API and worker incident testing
 
 This dataset models **1,000 incident groups × 3 distinct patients per incident × 3 encounter types per patient = 9,000 encounters**. Each patient has an Appointment, MedicationRefill and TelephoneTriage encounter. `incident_id` is grouping metadata in the dataset; the existing API stores each encounter with one fixed patient and type. No service schema change is required.
@@ -76,3 +78,29 @@ The live bulk provider uses one transient error followed by success or an immedi
 ## Verified full run
 
 The full run completed successfully: 1,000 incidents, 3,000 patients, 9,000 encounters and 90,000 HTTP update requests. Final current states were 6,750 ready and 2,250 expected permanent failures. One SLA breach was observed and recovered successfully after the worker restart. There were 14,437 synthetic provider invocations (including historical versions and retries). Total harness duration was 108.887 seconds on this machine; this is not a production SLA or throughput guarantee. See `incident-e2e-results.json` for the retained summary and `incident-e2e-full/` for the local database and process log.
+
+## Run this campaign using a real LLM
+
+The runner now supports explicit paid LLM mode. Export `OPENAI_API_KEY` securely in the same terminal, then start small:
+
+```sh
+LLM_MODEL=gpt-6.1-terra SUMMARY_MAX_WORDS=100 \
+python3.14 tools/incident_e2e.py run --use-llm --limit 9 --workers 2 \
+  --output test_data/incident-e2e-llm-small
+```
+
+`--limit 9` selects the first nine encounters (one incident, three patients and all three types). It still sends ten update requests per encounter, including version 12 and 13, duplicates, stale requests and conflicts. Both accepted versions can incur a generation charge, and retry/lease recovery may incur further charges. The runner does not ask for a key interactively or load `.env`; it validates the exported key/configuration before creating the output directory or starting workers.
+
+To run all 9,000 encounters with the LLM, explicitly set `--limit 9000`:
+
+```sh
+LLM_MODEL=gpt-6.1-terra SUMMARY_MAX_WORDS=100 \
+python3.14 tools/incident_e2e.py run --use-llm --limit 9000 --workers 4 \
+  --output test_data/incident-e2e-llm-full
+```
+
+In LLM mode the runner sets `USE_LLM=1`, removes inherited SUMMARY_URL/SUMMARY_MOCK from child process environments, and does not start the synthetic provider. The `normal/transient/permanent/slow` labels are dataset annotations, not live OpenAI fault instructions. All current jobs are expected to become ready; real model/API failures fail the campaign and are retained in its database/logs. Deliberate worker kill/restart is disabled to avoid intentionally repeating paid calls.
+
+Verification checks current version 13, fixed patient/type, nonempty summary text, rejection of the synthetic placeholder/hash outputs, and SUMMARY_MAX_WORDS (default 100). It cannot validate exact text hashes, clinical factuality or model attribution from the text alone. The runner controls adapter selection, and worker startup logs show adapter/model. Reports record provider_mode, model, word limit and verification scope; provider_invocations is null for OpenAI because no billing count is measured. A failed campaign can be inspected through its retained database and process.log.
+
+Without `--use-llm`, `run` continues to force synthetic mode even if USE_LLM=1 is exported. Use the flag to make the paid choice explicit. `--limit` also works with `load`; `--use-llm` does not, because `load` uses workers you started separately. Use Python 3.11+ (`python3.14` above matches the user's local interpreter).

@@ -1,28 +1,15 @@
 import argparse
-import json
 import logging
-import os
 import time
-import urllib.request
 import urllib.error
 from .store import Store
 from .workflow_log import emit
+from .summary_adapters import build_adapter, PROMPT_VERSION
 
 
 def generate_summary(transcription):
-    """Configured HTTP adapter; mock mode is explicitly for local orchestration demos."""
-    endpoint = os.environ.get('SUMMARY_URL')
-    if not endpoint:
-        if os.environ.get('SUMMARY_MOCK') != '1':
-            raise RuntimeError('provider_not_configured')
-        return 'Synthetic demo summary; not for clinical use.'
-    request = urllib.request.Request(endpoint, data=json.dumps({'transcription': transcription}).encode(),
-                                     headers={'Content-Type': 'application/json'}, method='POST')
-    with urllib.request.urlopen(request, timeout=20) as response:
-        result = json.load(response)['summary']
-        if not isinstance(result, str) or not result:
-            raise ValueError('invalid_provider_response')
-        return result
+    """Compatibility entry point; worker startup configures one reusable adapter."""
+    return build_adapter()(transcription)
 
 
 def tick(store, provider=generate_summary):
@@ -60,14 +47,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--db', default='encounters.db')
     parser.add_argument('--log-file', help='Append JSON workflow events to this file (default: stderr)')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--use-llm', dest='use_llm', action='store_true', help='Use the OpenAI LLM adapter')
+    mode.add_argument('--no-use-llm', dest='use_llm', action='store_false', help='Disable LLM; use HTTP/mock configuration')
+    parser.set_defaults(use_llm=None)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(message)s', filename=args.log_file)
-    emit('worker_started', database=args.db)
-    if not os.environ.get('SUMMARY_URL') and os.environ.get('SUMMARY_MOCK') != '1':
-        parser.error('set SUMMARY_URL or explicitly enable SUMMARY_MOCK=1')
+    try:
+        adapter = build_adapter(args.use_llm)
+    except ValueError as exc:
+        parser.error(str(exc))
+    emit('worker_started', database=args.db, adapter=type(adapter).__name__,
+         model=getattr(adapter, 'model', None), prompt_version=PROMPT_VERSION,
+         summary_max_words=getattr(adapter, 'max_words', None))
     store = Store(args.db)
     while True:
-        if not tick(store):
+        if not tick(store, adapter):
             time.sleep(.2)
 
 

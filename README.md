@@ -134,3 +134,100 @@ A successful workflow emits:
 Errors emit `summary_generation_failed` before the state decision. A fenced completion emits `completion_rejected` and cannot emit a successful commit. Correlate by `encounter_id`, `version`, `claim_id`, `worker_pid` and UTC timestamp. In the synthetic incident dataset, encounter IDs such as `inc-0000-pat-00-type-0` identify the incident group; no separate incident field is stored or inferred for arbitrary IDs.
 
 These logs demonstrate orchestration, not transcription generation: the API receives the full transcription and the worker summarizes it. They exclude patient IDs, transcript/summary text and raw exception details. Standard logs are best-effort observability, not an atomic audit ledger: a crash between database commit and logging can leave a committed change without its log entry. Query the database as the source of truth.
+
+## Use an LLM adapter for real summaries
+
+`summary_adapters.py` defines a callable `SummaryAdapter`: full transcription → summary string. The worker selects an adapter once at startup. LLM mode uses the OpenAI Responses API directly; it does not need `SUMMARY_URL` or a separately hosted summary server.
+
+```sh
+# Set OPENAI_API_KEY securely in your environment first; do not commit it.
+# Terminal 1:
+python3 -m encounter_service.api --db encounters.db --port 8000
+# Terminal 2:
+USE_LLM=1 LLM_MODEL=gpt-6.1-terra \
+  python3 -m encounter_service.worker --db encounters.db --log-file /tmp/llm-worker.jsonl
+
+# Equivalent CLI flag (takes precedence over USE_LLM):
+python3 -m encounter_service.worker --db encounters.db --use-llm
+
+# Force free demo behavior, even if USE_LLM is inherited as enabled:
+USE_LLM=0 SUMMARY_MOCK=1 python3 -m encounter_service.worker --db encounters.db --no-use-llm
+```
+
+When disabling LLM, unset SUMMARY_URL if you want mock mode: HTTP mode has precedence over SUMMARY_MOCK. With `USE_LLM=1` or `--use-llm`, LLM mode takes precedence over SUMMARY_URL and SUMMARY_MOCK and requires OPENAI_API_KEY. Missing/invalid configuration fails before claiming database work. `.env.example` documents the variables; files are not automatically loaded. CLI `--no-use-llm` explicitly disables LLM. The bulk incident test runner defaults to `USE_LLM=0`; only an explicit `run --use-llm` enables paid calls. An inherited environment flag alone does not enable them.
+
+### Model candidates
+
+Initial recommendation: **`gpt-6.1-terra`**, for a balance of writing quality and efficiency. This is an engineering starting point, not a measured clinical model ranking. Compare candidates on representative synthetic/de-identified transcripts before production use.
+
+- [`gpt-6.1-terra`](https://developers.openai.com/api/docs/models/gpt-6.1-terra): documented as fast/efficient with natural writing; the configured default.
+- [`gpt-6-luna`](https://developers.openai.com/api/docs/models/gpt-6-luna): documented for efficient focused high-volume tasks; a lower-cost candidate to evaluate for straightforward summaries.
+- [`gpt-6-astra`](https://developers.openai.com/api/docs/models/gpt-6-astra): documented as the most capable model for demanding work; evaluate for difficult or ambiguous transcripts with greater cost/latency tolerance.
+
+Official documentation checked 12 November 2026. Model access depends on the API project. `LLM_MODEL` selects the model and `LLM_REASONING_EFFORT` selects reasoning effort (default `low`). Only use effort values supported by that model. No automatic model fallback is performed because another paid call can change cost and wording.
+
+### Adapter behavior and limits
+
+The full unchanged transcript is passed as input, separate from instructions. Prompt version `encounter-summary-v1` requests a faithful summary preserving negation, uncertainty, medication doses/units and discussed plans; it treats instructions inside the transcript as source content rather than commands and prohibits invented diagnoses/advice. This mitigates, but does not eliminate, hallucination or prompt injection. Clinical review and transcript-specific quality evaluation remain necessary.
+
+Each invocation makes one authenticated HTTP request to `https://api.openai.com/v1/responses` with `store=false`, a 2,048-output-token budget and 20-second socket timeout. There are no adapter-level retries. Existing worker handling owns 429/408/5xx retries and their costs. Completed assistant text is extracted from the raw Responses output; reasoning text is excluded. Refusals, empty/malformed responses and incomplete/truncated outputs fail permanently rather than saving partial clinical summaries. Operators may explicitly redrive after fixing the model/budget/input issue. Transcripts are never silently shortened. Oversized model-context requests are rejected by the provider and handled as permanent 4xx failures.
+
+`store=false` disables response storage through that API feature; it is not a promise of zero retention or suitable clinical-data processing terms. The 20-second socket timeout is still not a strict total deadline; existing lease/fencing limits apply. Under-ten-second completion is a target to measure, not a model guarantee. Provider/model/prompt version are logged at worker startup, but are not persisted per result in the current schema; use a fixed worker configuration per campaign for traceability. Existing completed results are not regenerated automatically when changing models.
+
+Adapter tests mock the HTTP boundary and make no paid calls. A live LLM invocation requires your OPENAI_API_KEY and incurs provider charges. See [Responses API reference](https://developers.openai.com/api/reference/resources/responses/methods/create).
+
+
+### Restrict LLM summary length
+
+LLM summaries now default to a maximum of **100 whitespace-separated words**, including headings. Configure the limit before starting the worker:
+
+```sh
+USE_LLM=1 SUMMARY_MAX_WORDS=100 python3 -m encounter_service.worker --db encounters.db --use-llm
+```
+
+Restart existing workers to apply the setting. The prompt requests the cap and the adapter checks the completed output before saving it. Token limits are not word limits. Over-limit output is rejected as an invalid provider response: the job becomes failed with a null summary, without automatically buying another call or silently truncating clinical information. An operator can adjust the limit and explicitly redrive failed current work. Existing ready summaries and HTTP/mock adapters are unchanged. Prompt version is now `encounter-summary-v2`; the configured word limit appears in worker startup logs.
+
+### Use the incident runner with the LLM
+
+After exporting OPENAI_API_KEY, run a small paid campaign explicitly:
+
+```sh
+LLM_MODEL=gpt-6.1-terra SUMMARY_MAX_WORDS=100 \
+python3.14 tools/incident_e2e.py run --use-llm --limit 9 --workers 2 \
+  --output test_data/incident-e2e-llm-small
+```
+
+The default `run` still uses the synthetic provider. `--use-llm` starts workers with the OpenAI adapter; `--limit` restricts encounter count. LLM campaigns validate bounded nonempty current-version summaries rather than synthetic hashes and skip deliberate provider faults/worker kills. See [the incident guide](test_data/INCIDENTS.md) for costs, expected outcomes and full-run instructions.
+
+
+## Default test size: 100
+
+The incident runner now ingests **100 encounters by default** (1,000 update POST requests). It selects the first 100 rows of the larger dataset, covering all three encounter types and all four provider modes in synthetic runs. This is 11 complete incident groups plus one encounter from the next group; the last group is intentionally partial. Synthetic runs retain concurrent duplicates, stale updates, identity/content conflicts, transient retries, permanent failures and the worker restart check. LLM runs use real summaries and do not inject provider failures.
+
+```sh
+# Free live HTTP/API/worker run, 100 encounters:
+python3.14 tools/incident_e2e.py run --output test_data/incident-e2e-100
+
+# Paid LLM run, 100 encounters (requires exported OPENAI_API_KEY):
+python3.14 tools/incident_e2e.py run --use-llm --workers 2 --output test_data/incident-e2e-llm-100
+
+# All 12 deterministic failure scenarios, 100 cases, no paid calls:
+python3 tools/scenario_cases.py run
+
+# Explicitly opt back into larger campaigns:
+python3 tools/incident_e2e.py run --limit 9000 --output test_data/incident-e2e-full-new
+python3 tools/scenario_cases.py run --data test_data/scenarios-10000.jsonl --report /tmp/results-10000.json
+```
+
+The deterministic 100-case dataset is `test_data/scenarios-100.jsonl`; its report is `test_data/results-100.json`. This complements the live workflow campaign: every failure ordering is not guaranteed by a live concurrent run. One hundred encounters can incur more than one hundred paid invocations because each receives two accepted versions and retries can occur.
+
+
+## Compare the transcription and summary
+
+`GET /encounters/{id}/summary` includes a top-level `transcription` field with the full unchanged input for the returned current `version`. It is available while queued/processing, ready or failed; `summary` remains null until that version is ready. An older result cannot be paired with a newer transcript. Restart the API process to load this change, keeping its current database path and port. No database migration or summary regeneration is required.
+
+```json
+{"encounter_id":"enc-42","version":12,"status":"ready","transcription":"Nurse: How are you? Patient: Feeling better.","summary":"Patient reports feeling better."}
+```
+
+Example is abbreviated; the endpoint also returns the existing identity, timing and progress fields. Transcription content is returned to the requesting client but remains excluded from workflow logs.

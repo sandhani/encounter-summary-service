@@ -474,7 +474,7 @@ The current-summary query joins only the job whose version equals `encounters.cu
 
 #### Retry and paid-call policy
 
-There are at most six automatic claims per job cycle. Claims consume attempts conservatively even when a worker crashes before dispatch. Retryable failures include 408, 429, 5xx, timeouts, and network exceptions. Other 4xx and provider failures raised as `ValueError` fail immediately. The adapter validates nonempty summary strings; malformed JSON and invalid summary values follow that permanent-error path. A missing `summary` key currently falls into the generic retryable exception path.
+There are at most six automatic claims per job cycle. Claims consume attempts conservatively even when a worker crashes before dispatch. Retryable failures include 408, 429, 5xx, timeouts, and network exceptions. Other 4xx and provider failures raised as `ValueError` fail immediately. The adapter validates nonempty summary strings; malformed JSON and invalid summary values follow that permanent-error path. A missing `summary` key in the HTTP adapter is now a permanent invalid-response failure.
 
 After attempts 1–5, the delay ranges are 1–2, 2–4, 4–8, 8–16 and 16–32 seconds. There is no delay after terminal attempt 6. The general formula caps delays at 300 seconds, though the six-attempt default never reaches that cap. `Retry-After` and a shared circuit breaker are not implemented.
 
@@ -532,7 +532,7 @@ An identical event replay does not redrive a failed job: it is still a duplicate
 | Newer version and out-of-order completion | Claim 12, ingest/claim 13, complete 13 then 12; separately leave an obsolete job queued | Current returns 13's result; 12 is historical. Queued obsolete work is superseded with no provider invocation. |
 | Outage, conflicts and operational boundaries | Inject retryable/permanent provider errors, exhaust attempts and redrive; submit conflicting identities; cross SLA boundary | Retry timing follows due times; permanent errors fail immediately; six claims bound recovery cost; only failed-current redrive succeeds; conflicts leave state unchanged; SLA breach alone preserves workflow status. |
 
-The project contains 32 automated tests, including HTTP request/response lifecycle coverage, long Unicode transcript preservation and error sanitization. Run:
+The project contains 41 automated tests, including HTTP request/response lifecycle coverage, long Unicode transcript preservation and error sanitization. Run:
 
 ```sh
 python3 -m unittest discover -s tests -v
@@ -551,3 +551,12 @@ Tests use temporary SQLite databases, injected clocks, mocked providers and in-m
 **Recommended structured logs:** opaque correlation/job identifiers, version, worker identity, attempt number, state transition, duration and sanitized error category. Avoid patient IDs where possible, keep identifiers out of metric labels, and do not log transcriptions, summaries, payload digests, raw provider bodies, credentials or exception text. The current HTTP handler suppresses default access logs; worker failures persist safe categories rather than raw exception messages. Structured worker transition logging is implemented: see the README section “Follow worker processing in the logs.” Metrics exporters and alerts remain integration recommendations, not installed components.
 
 To investigate a stuck job: determine whether it is current, compare acceptance age to the SLA, inspect status/due/lease/attempts, check worker liveness and queue depth, then correlate provider error/latency and database health. If terminally failed, fix the underlying dependency before an explicit redrive. No patient content is needed for this diagnosis.
+
+
+## LLM adapter implementation update — 12 November 2026
+
+A direct OpenAI Responses adapter is available in `encounter_service/summary_adapters.py`. Its callable contract remains `transcription -> summary`; database ownership, version fencing and retry transactions are unchanged. Select it using `USE_LLM=1` or `--use-llm` and supply `OPENAI_API_KEY` securely. The initial default is `gpt-6.1-terra`, configurable using `LLM_MODEL`; reasoning defaults to `low`. `--no-use-llm` overrides the environment flag, retaining the previous HTTP/mock provider selection. The API key is required before work is claimed.
+
+The adapter sends the complete transcript with separate factual-summary instructions, `store=false`, no tools, and a 2,048-output-token cap. It validates completed assistant output and rejects refusal, incomplete/truncated or empty output. One adapter call makes one remote request; the durable job policy remains responsible for retries. No live paid model invocation has been performed as part of this change; tests mock the HTTP boundary. The bulk runner disables LLM mode by default; explicit `run --use-llm` enables paid generation and `--limit` bounds the selected encounters.
+
+Model selection is a candidate recommendation, not clinical validation. [GPT-6.1 Terra](https://developers.openai.com/api/docs/models/gpt-6.1-terra) is the initial balance of writing and efficiency; [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) is the efficient high-volume candidate; [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) is the demanding-work candidate. Evaluate factual omissions, invented facts, negation/dose preservation, latency and cost on representative transcripts. Model access, provider terms, clinical review, strict deadlines and production security remain deployment considerations. Model/prompt metadata is logged at startup but not saved per job result. See the README's LLM section for complete configuration and run instructions.

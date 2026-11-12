@@ -1,0 +1,27 @@
+{
+  "total": 100,
+  "passed": 100,
+  "failed": 0,
+  "duration_seconds": 2.047,
+  "scenarios": {
+    "concurrent_duplicate": 9,
+    "version_gap": 9,
+    "restart_after_commit": 9,
+    "worker_interruption": 9,
+    "newer_during_processing": 8,
+    "out_of_order_results": 8,
+    "outage_exhaustion_redrive": 8,
+    "identity_conflict": 8,
+    "payload_conflict": 8,
+    "event_id_conflict": 8,
+    "transaction_rollback": 8,
+    "validation": 8
+  },
+  "encounter_types": {
+    "Appointment": 39,
+    "MedicationRefill": 31,
+    "TelephoneTriage": 30
+  },
+  "failures": [],
+  "scope": "Synthetic store/worker orchestration; no live HTTP, AI calls or host kills"
+}

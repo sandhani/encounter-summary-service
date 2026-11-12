@@ -5,3 +5,6 @@ __pycache__/
 *.db-shm
 /test_data/*e2e*/
 /test_data/e2e-run/
+.env
+.env.*
+!.env.example

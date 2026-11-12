@@ -237,11 +237,11 @@ def run(dataset, report_path, limit=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('generate', 'run'))
-    parser.add_argument('--data', type=Path, default=Path('test_data/scenarios-10000.jsonl'))
-    parser.add_argument('--count', type=int, default=10000)
+    parser.add_argument('--data', type=Path, default=Path('test_data/scenarios-100.jsonl'))
+    parser.add_argument('--count', type=int, default=100)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--limit', type=int)
-    parser.add_argument('--report', type=Path, default=Path('test_data/results.json'))
+    parser.add_argument('--report', type=Path, default=Path('test_data/results-100.json'))
     args = parser.parse_args()
     if args.count < 1 or (args.limit is not None and args.limit < 1):
         parser.error('count and limit must be positive')

@@ -122,7 +122,7 @@ def load(rows, base, clients):
     return dict(counts)
 
 
-def verify(rows, base, deadline):
+def verify(rows, base, deadline, use_llm=False, max_words=100):
     pending = {r['event']['encounter_id']: r for r in rows}
     counts = Counter()
     while pending:
@@ -134,12 +134,19 @@ def verify(rows, base, deadline):
                 raise AssertionError(f'current version mismatch: {enc}')
             if result['status'] not in ('ready','failed'):
                 continue
-            expected = 'failed' if row['scenario']=='permanent' else 'ready'
+            expected = 'failed' if not use_llm and row['scenario']=='permanent' else 'ready'
             if result['status']!=expected:
-                raise AssertionError(f'unexpected terminal status: {enc}, {result["status"]}')
+                raise AssertionError(f'unexpected terminal status: {enc}, {result["status"]}, error={result.get("error")}')
             if expected=='ready':
                 text = row['event']['payload']['transcription']+'\nsnapshot=13'
-                if result['summary']!=digest(text):
+                if use_llm:
+                    summary = result.get('summary')
+                    if (not isinstance(summary, str) or not summary.strip()
+                            or summary.startswith('Synthetic summary sha256=')
+                            or summary == 'Synthetic demo summary; not for clinical use.'
+                            or len(summary.split()) > max_words):
+                        raise AssertionError(f'invalid LLM summary: {enc}')
+                elif result['summary']!=digest(text):
                     raise AssertionError(f'wrong-version summary: {enc}')
             elif result['error']!='provider_http_400':
                 raise AssertionError(f'wrong error: {enc}')
@@ -163,15 +170,32 @@ def main():
     p.add_argument('--workers',type=int,default=8)
     p.add_argument('--timeout',type=int,default=3600)
     p.add_argument('--api',default='http://127.0.0.1:8000')
+    p.add_argument('--use-llm', action='store_true', help='Use paid OpenAI summaries instead of the synthetic provider (run only)')
+    p.add_argument('--limit', type=int, default=100, help='Encounter rows to ingest (default: 100; use 9000 for the full dataset)')
     p.add_argument('--output',type=Path,default=ROOT/'test_data/e2e-run')
     args=p.parse_args()
     if min(args.incidents,args.patients,args.clients,args.workers,args.timeout)<1:
         p.error('counts and timeout must be positive')
+    if args.limit is not None and args.limit < 1:
+        p.error('limit must be positive')
+    if args.use_llm and args.command != 'run':
+        p.error('--use-llm is available only with run; load uses your existing worker configuration')
+    adapter = None
+    if args.use_llm:
+        from encounter_service.summary_adapters import build_adapter
+        try:
+            adapter = build_adapter(True)
+        except ValueError as exc:
+            p.error(str(exc))
     if args.command=='generate':
         generate(args.data,args.incidents,args.patients)
         print(f'Generated {args.incidents*args.patients*3} encounters at {args.data}')
         return
-    rows=[json.loads(line) for line in args.data.open()]
+    from itertools import islice
+    with args.data.open() as data:
+        rows=[json.loads(line) for line in islice(data, args.limit)]
+    if not rows:
+        p.error('dataset is empty')
     if args.command=='load':
         print(json.dumps(load(rows,args.api,args.clients),indent=2))
         return
@@ -179,21 +203,35 @@ def main():
     args.output.mkdir(parents=True,exist_ok=False)
     db=args.output/'encounters.db'
     report={'encounters':len(rows),'incidents':len({r['incident_id'] for r in rows}),
-            'patients':len({r['event']['patient_id'] for r in rows}), 'passed':False}
+            'patients':len({r['event']['patient_id'] for r in rows}), 'passed':False,
+            'provider_mode':'openai' if args.use_llm else 'synthetic',
+            'model':getattr(adapter,'model',None),
+            'summary_max_words':getattr(adapter,'max_words',None),
+            'verification':'version/identity and nonempty bounded LLM output; not clinical quality' if args.use_llm else 'exact synthetic transcript hash'}
+    print(f"Mode: {report['provider_mode']}; encounters: {len(rows)}; workers: {args.workers}", flush=True)
+    if args.use_llm:
+        print('Paid OpenAI calls enabled. Both v12 and v13 may be processed; retries may incur additional charges.', flush=True)
     processes=[]
-    server=ThreadingHTTPServer(('127.0.0.1',0),Provider)
-    thread=threading.Thread(target=server.serve_forever,daemon=True)
-    thread.start()
+    server=None
     log=(args.output/'process.log').open('w')
     started=time.monotonic()
     try:
+        if not args.use_llm:
+            Provider.calls.clear()
+            server=ThreadingHTTPServer(('127.0.0.1',0),Provider)
+            threading.Thread(target=server.serve_forever,daemon=True).start()
         # Reserve the API port; the API process binds after the reservation is released.
         import socket
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0))
             port=sock.getsockname()[1]
         base=f'http://127.0.0.1:{port}'
-        env=dict(os.environ,SUMMARY_URL=f'http://127.0.0.1:{server.server_port}/summary')
+        env=dict(os.environ, USE_LLM='1' if args.use_llm else '0')
+        if args.use_llm:
+            env.pop('SUMMARY_URL',None)
+            env.pop('SUMMARY_MOCK',None)
+        else:
+            env['SUMMARY_URL']=f'http://127.0.0.1:{server.server_port}/summary'
         def start(module, extra=()):
             process=subprocess.Popen([sys.executable,'-m',module,'--db',str(db),*extra],cwd=ROOT,env=env,stdout=log,stderr=log)
             processes.append(process)
@@ -213,11 +251,15 @@ def main():
         report['http_outcomes']=load(rows,base,args.clients)
         # Restart a worker process while backlog exists. Depending on timing, it may be idle
         # or processing; deterministic lease-fencing is separately tested by unit scenarios.
-        workers[0].kill()
-        workers[0].wait()
-        start('encounter_service.worker')
-        report['results']=verify(rows,base,time.monotonic()+args.timeout)
-        report['provider_invocations']=sum(Provider.calls.values())
+        if not args.use_llm:
+            workers[0].kill()
+            workers[0].wait()
+            start('encounter_service.worker')
+        # Do not deliberately interrupt paid calls or synthesize provider errors in LLM mode.
+        report['worker_restart_tested']=not args.use_llm
+        report['results']=verify(rows,base,time.monotonic()+args.timeout,
+                                 use_llm=args.use_llm, max_words=getattr(adapter,'max_words',100))
+        report['provider_invocations']=None if args.use_llm else sum(Provider.calls.values())
         report['passed']=True
     except Exception as exc:
         report['error']=f'{type(exc).__name__}: {exc}'
@@ -232,8 +274,9 @@ def main():
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        server.shutdown()
-        server.server_close()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
         log.close()
         report['duration_seconds']=round(time.monotonic()-started,3)
         (args.output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
